@@ -1,9 +1,13 @@
 package Sockets;
 
+import Helpers.Enjoyer;
+import Logging.ConsoleLogger;
 import Logging.Logger;
 import Helpers.Character;
 import Repositories.Specifications.CharacterRepository;
+import Repositories.Specifications.CharacterSpecifications.CharacterByEnjoyerIdSpecification;
 import Repositories.Specifications.EnjoyerRepository;
+import Repositories.Specifications.EnjoyerSpecifications.EnjoyerBySigninCredentials;
 
 import java.io.*;
 import java.net.DatagramPacket;
@@ -12,6 +16,8 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
+import java.sql.SQLException;
+import java.util.Collection;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,10 +41,18 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
     private static ConcurrentHashMap<Integer, ClientConnectionObject> clientMap;
 
     //declare repositories to draw data from
-    final private EnjoyerRepository enjoyerRepo = new EnjoyerRepository();
-    final private CharacterRepository characterRepo = new CharacterRepository();
+    private EnjoyerRepository enjoyerRepo;
+    private CharacterRepository characterRepo;
 
     public WizardGoServer(int tcpPort, int udpPort, Logger logger) throws IOException {
+        try{
+            enjoyerRepo = new EnjoyerRepository(new ConsoleLogger());
+            characterRepo = new CharacterRepository(new ConsoleLogger());
+        }
+        catch(SQLException e){
+            logger.logError(e);
+        }
+
         //initialize the tcp socket
         tcpSocket = new ServerSocket(tcpPort);
         //initialize the udp socket
@@ -80,7 +94,20 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
     @Override
     //closes a client connection based on the connection id
     public void closeClient(int connectionId) {
-        //TODO: this
+        synchronized (clientMap){
+            try{
+                Socket socket = clientMap.get(connectionId).getSocket();
+
+                //safely shut down socket connection
+                socket.shutdownInput();
+                socket.shutdownOutput();
+                socket.close();
+            }
+            catch(IOException e){
+                logger.logError(e);
+            }
+            clientMap.remove(connectionId);
+        }
     }
 
     @Override
@@ -99,11 +126,15 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
 
     @Override
     public void run(){
-        //start udp thread for receiving and sending position data
-        //Thread udpThread
+        logger.logMessage("Server started");
+
+        //start udp thread for receiving and updating position data
+        UdpReceiverThread udpThread = new UdpReceiverThread();
+        udpThread.start();
 
         while(!this.isInterrupted()){
             try {
+                logger.logMessage("Ready for new connection (" + clientMap.size() + "/" + MAX_CLIENTS + ")");
                 //listen for new connections via tcp
                 Socket newConnection = tcpSocket.accept();
                 //assign a client id to the client
@@ -115,13 +146,57 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
         }
     }
 
+    private long signInClient(String email, String password){
+        Enjoyer enjoyer = enjoyerRepo.query(new EnjoyerBySigninCredentials(email, password)).iterator().next();
+
+        if(enjoyer != null){
+            return enjoyer.getId();
+        }
+
+        return 0;
+    }
 
     private void changeUserCharacter(long id, ClientConnectionObject client){
         //check if user owns the characterId
+        Collection<Character> characters = characterRepo.query(new CharacterByEnjoyerIdSpecification(id, client.enjoyerId));
+        if(!characters.isEmpty()){
+            Character character = characters.iterator().next();
+            client.setCharacterId(character.getId());
 
-        //change characterId on connection object
-        //broadcast characterId change to other clients
-        //TODO: this too
+            ByteBuffer buffer = ByteBuffer.allocate(9);
+            //50 = id for character change
+            buffer.put((byte)50);
+            buffer.putLong(client.getEnjoyerId());
+            buffer.putLong(character.getId());
+
+            buffer.flip();
+            DatagramPacket packet = new DatagramPacket(buffer.array(), buffer.remaining());
+            packet.setPort(udpSocket.getLocalPort());
+
+            //send packet twice for a better chance of the message arriving successfully
+            //since the message is quite important (from 75% chance of packet arriving to ~94%)
+            sendBroadCast(packet);
+            sendBroadCast(packet);
+        }
+    }
+
+    //broadcasts udp packet to all clients who have opted in to receive player updates
+    private void sendBroadCast(DatagramPacket packet) {
+        //set the port of the packet
+        packet.setPort(udpSocket.getLocalPort());
+
+        synchronized (clientMap){
+            if(clientMap.size() > 0){
+                //loop through all connected clients
+                for (ClientConnectionObject client : clientMap.values()){
+                    //check if the client sends/receives data about location
+                    if(client.getBroadcastLocation()){
+                        packet.setAddress(client.getSocket().getInetAddress());
+
+                    }
+                }
+            }
+        }
     }
 
     //position updater thread for updating location data between clients
@@ -132,7 +207,7 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
         @Override
         public void run(){
             //declare receive buffer
-            ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
+            ByteBuffer buffer;
 
             //start a thread meant for location updates based on input location data
             LocationUpdaterThread locationUpdaterThread = new LocationUpdaterThread();
@@ -140,8 +215,9 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
 
             //udp receiver loop
             while(!this.isInterrupted()){
+                buffer = ByteBuffer.allocate(BUFFER_SIZE);
                 //set data packet as empty
-                DatagramPacket newPacket = new DatagramPacket(buffer.array(), buffer.array().length);
+                DatagramPacket newPacket = new DatagramPacket(buffer.array(), buffer.remaining());
 
                 try {
                     //fill packet with new data
@@ -191,6 +267,7 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
         }
     }
 
+    //thread to update location data for a client
     protected class LocationUpdaterThread extends Thread{
         @Override
         public void run(){
@@ -217,21 +294,16 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
                         }
                     }
 
+                    //flip buffer to set limit and position
+                    buffer.flip();
+
                     //create new udp packet based on the byte buffer array
-                    DatagramPacket packet = new DatagramPacket(buffer.array(), buffer.array().length);
-                    //set the port of the packet
-                    packet.setPort(udpSocket.getPort());
+                    sendBroadCast(new DatagramPacket(buffer.array(), buffer.remaining()));
 
-                    if(clientMap.size() > 0){
-                        //loop through all connected clients
-                        for (ClientConnectionObject client : clientMap.values()){
-                            //check if the client sends/receives data about location
-                            if(client.getBroadcastLocation()){
-                                packet.setAddress(client.getSocket().getInetAddress());
-
-                            }
-                        }
-                    }
+                    //reset buffer
+                    buffer.clear();
+                    buffer.put(new byte[1024]);
+                    buffer.clear();
 
                     //sleep thread to fit our update interval
                     Thread.sleep(LOCATION_UPDATE_INTERVAL);
@@ -274,59 +346,86 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
             //declare streams
             InputStream inStream = null;
             DataOutputStream outStream = null;
-            //BufferedReader reader = null;
             try{
                 //initialize streams
                 buffer = ByteBuffer.allocate(BUFFER_SIZE);
                 inStream = socket.getInputStream();
                 outStream = new DataOutputStream(socket.getOutputStream());
 
+                //127 is id for connection id changes
+                buffer.put((byte)127);
                 //write connection id to buffer to prepare it for the client
                 buffer.putInt(connectionId);
+                //flip buffer to set limit and position
+                buffer.flip();
                 //send id to client
                 outStream.write(buffer.array());
                 //clear the buffer
                 buffer.clear();
+                buffer.put(new byte[1024]);
+                buffer.clear();
 
                 //start the main accept loop
-                while(!this.isInterrupted()){
+                while(!this.isInterrupted() && socket.isConnected()){
                     //check if bytes are available
                     if(inStream.available() > 0){
                         //read bytes from stream
                         int b = inStream.read(buffer.array(), 0, inStream.available());
+                        //handle request based on id
+                        handleRequest(buffer.get());
+                        //allocate new buffer
+                        buffer.clear();
+                        buffer.put(new byte[1024]);
+                        buffer.clear();
                     }
 
-                    //handle request based on id
-                    handleRequest(buffer.get());
                 }
 
+                closeClient(connectionId);
+
             }
-            catch(Exception e){}
+            catch(Exception e){
+                logger.logError(e);
+            }
         }
 
         private void handleRequest(byte b) {
             /*
-            * 1 - change characterId
+            * 1 - change character
             * 2 - set location visibility
             * 3 - player request
+            * 4 - sign in request
             * */
             switch(b){
                 case 1:
                     long characterId = buffer.getLong();
                     changeUserCharacter(characterId, this);
-                    buffer.clear();
                     break;
                 case 2:
                     broadcastLocation = buffer.get() == 1 ? true : false;
-                    buffer.clear();
                     break;
                 case 3:
                     //player requests like messaging, trading, party invites and so forth
-                    buffer.clear();
+                    break;
+                case 4:
+                    //fetch email string from byte buffer
+                    int length = buffer.getInt();
+                    byte[] email = new byte[length];
+                    for (int i = 0; i < length; i++){
+                        email[i] = buffer.get();
+                    }
+
+                    //fetch password string from byte buffer
+                    length = buffer.getInt();
+                    byte[] password = new byte[length];
+                    for (int i = 0; i < length; i++){
+                        password[i] = buffer.get();
+                    }
+
+                    enjoyerId = signInClient(new String(email), new String(password));
                     break;
                 default:
                     //invalid request, ignore
-                    buffer.clear();
                     break;
             }
         }
@@ -386,6 +485,24 @@ public class WizardGoServer extends Thread implements MultiClientServer, ClientI
 
         public void setConnectionId(int connectionId) {
             this.connectionId = connectionId;
+        }
+    }
+
+    public void handleCommand(String cmd, Object param){
+        switch(cmd){
+            case "shutdown":
+                break;
+            case "close":
+                try{
+
+                }
+                catch(Exception e){
+                    logger.logError(e);
+                }
+                break;
+            default:
+                logger.logMessage("Invalid command");
+                break;
         }
     }
 }
